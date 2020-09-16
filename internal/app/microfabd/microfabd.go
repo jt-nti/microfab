@@ -17,8 +17,10 @@ import (
 	"time"
 
 	"github.com/IBM-Blockchain/microfab/internal/pkg/blocks"
+	"github.com/IBM-Blockchain/microfab/internal/pkg/ca"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/channel"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/console"
+	"github.com/IBM-Blockchain/microfab/internal/pkg/couchdb"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/orderer"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/organization"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/peer"
@@ -28,17 +30,25 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var logger = log.New(os.Stdout, fmt.Sprintf("[%16s] ", "microfabd"), log.LstdFlags)
+
 // Microfab represents an instance of the Microfab application.
 type Microfab struct {
 	sync.Mutex
+	sigs                   chan os.Signal
+	done                   chan struct{}
+	started                bool
 	config                 *Config
 	ordererOrganization    *organization.Organization
 	endorsingOrganizations []*organization.Organization
 	organizations          []*organization.Organization
 	orderer                *orderer.Orderer
 	ordererConnection      *orderer.Connection
+	couchDB                *couchdb.CouchDB
+	couchDBProxies         []*couchdb.Proxy
 	peers                  []*peer.Peer
 	peerConnections        []*peer.Connection
+	cas                    []*ca.CA
 	genesisBlocks          map[string]*common.Block
 	console                *console.Console
 	proxy                  *proxy.Proxy
@@ -50,21 +60,27 @@ func New() (*Microfab, error) {
 	if err != nil {
 		return nil, err
 	}
-	fablet := &Microfab{
-		config: config,
-	}
-	return fablet, nil
+	return &Microfab{
+		config:  config,
+		sigs:    make(chan os.Signal, 1),
+		done:    make(chan struct{}, 1),
+		started: false,
+	}, nil
 }
 
-// Run runs the Fablet application.
-func (m *Microfab) Run() error {
+// Start starts the Microfab application.
+func (m *Microfab) Start() error {
 
 	// Grab the start time and say hello.
 	startTime := time.Now()
-	log.Print("Starting Microfab ...")
+	logger.Print("Starting Microfab ...")
 
 	// Ensure anything we start is stopped.
-	defer m.stop()
+	defer func() {
+		if !m.started {
+			m.stop()
+		}
+	}()
 
 	// Ensure the directory exists and is empty.
 	err := m.ensureDirectory()
@@ -96,18 +112,38 @@ func (m *Microfab) Run() error {
 	m.organizations = append(m.organizations, m.ordererOrganization)
 	m.organizations = append(m.organizations, m.endorsingOrganizations...)
 
-	// Create and start all of the components (orderer, peers).
+	// Wait for CouchDB to start.
+	if m.config.CouchDB {
+		err = m.waitForCouchDB()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Create and start all of the components (orderer, peers, CAs).
 	eg.Go(func() error {
 		return m.createAndStartOrderer(m.ordererOrganization, 7050, 7051)
 	})
 	for i := range m.endorsingOrganizations {
 		organization := m.endorsingOrganizations[i]
-		apiPort := 7052 + (i * 3)
-		chaincodePort := 7053 + (i * 3)
-		operationsPort := 7054 + (i * 3)
+		numPorts := 6
+		peerAPIPort := 7052 + (i * numPorts)
+		peerChaincodePort := 7053 + (i * numPorts)
+		peerOperationsPort := 7054 + (i * numPorts)
+		couchDBProxyPort := 7055 + (i * numPorts)
+		caAPIPort := 7056 + (i * numPorts)
+		caOperationsPort := 7057 + (i * numPorts)
+		if m.config.CouchDB {
+			go m.createAndStartCouchDBProxy(organization, couchDBProxyPort)
+		}
 		eg.Go(func() error {
-			return m.createAndStartPeer(organization, apiPort, chaincodePort, operationsPort)
+			return m.createAndStartPeer(organization, peerAPIPort, peerChaincodePort, peerOperationsPort, m.config.CouchDB, couchDBProxyPort)
 		})
+		if m.config.CertificateAuthorities {
+			eg.Go(func() error {
+				return m.createAndStartCA(organization, caAPIPort, caOperationsPort)
+			})
+		}
 	}
 	err = eg.Wait()
 	if err != nil {
@@ -120,7 +156,7 @@ func (m *Microfab) Run() error {
 	})
 
 	// Create and start the console.
-	console, err := console.New(m.organizations, m.orderer, m.peers, 8081, fmt.Sprintf("http://console.%s:%d", m.config.Domain, m.config.Port))
+	console, err := console.New(m.organizations, m.orderer, m.peers, m.cas, 8081, fmt.Sprintf("http://console.%s:%d", m.config.Domain, m.config.Port))
 	if err != nil {
 		return err
 	}
@@ -128,7 +164,7 @@ func (m *Microfab) Run() error {
 	go console.Start()
 
 	// Create and start the proxy.
-	proxy, err := proxy.New(console, m.orderer, m.peers, m.config.Port)
+	proxy, err := proxy.New(console, m.orderer, m.peers, m.cas, m.config.Port)
 	if err != nil {
 		return err
 	}
@@ -171,15 +207,34 @@ func (m *Microfab) Run() error {
 	// Say how long start up took, then wait for signals.
 	readyTime := time.Now()
 	startupDuration := readyTime.Sub(startTime)
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	log.Printf("Microfab started in %vms", startupDuration.Milliseconds())
-	<-sigs
-	log.Printf("Stopping Microfab due to signal ...")
-	m.stop()
-	log.Printf("Microfab stopped")
+	logger.Printf("Microfab started in %vms", startupDuration.Milliseconds())
+	signal.Notify(m.sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-m.sigs
+		logger.Printf("Stopping Microfab due to signal ...")
+		m.stop()
+		logger.Printf("Microfab stopped")
+		close(m.done)
+		m.started = false
+	}()
+	m.started = true
 	return nil
 
+}
+
+// Stop stops the Microfab application.
+func (m *Microfab) Stop() {
+	if m.started {
+		m.sigs <- syscall.SIGTERM
+		<-m.done
+	}
+}
+
+// Wait waits for the Microfab application.
+func (m *Microfab) Wait() {
+	if m.started {
+		<-m.done
+	}
 }
 
 func (m *Microfab) ensureDirectory() error {
@@ -228,7 +283,7 @@ func (m *Microfab) removeDirectory() error {
 }
 
 func (m *Microfab) createOrderingOrganization(config Organization) error {
-	log.Printf("Creating ordering organization %s ...", config.Name)
+	logger.Printf("Creating ordering organization %s ...", config.Name)
 	organization, err := organization.New(config.Name)
 	if err != nil {
 		return err
@@ -236,12 +291,12 @@ func (m *Microfab) createOrderingOrganization(config Organization) error {
 	m.Lock()
 	defer m.Unlock()
 	m.ordererOrganization = organization
-	log.Printf("Created ordering organization %s", config.Name)
+	logger.Printf("Created ordering organization %s", config.Name)
 	return nil
 }
 
 func (m *Microfab) createEndorsingOrganization(config Organization) error {
-	log.Printf("Creating endorsing organization %s ...", config.Name)
+	logger.Printf("Creating endorsing organization %s ...", config.Name)
 	organization, err := organization.New(config.Name)
 	if err != nil {
 		return err
@@ -249,12 +304,12 @@ func (m *Microfab) createEndorsingOrganization(config Organization) error {
 	m.Lock()
 	defer m.Unlock()
 	m.endorsingOrganizations = append(m.endorsingOrganizations, organization)
-	log.Printf("Created endorsing organization %s", config.Name)
+	logger.Printf("Created endorsing organization %s", config.Name)
 	return nil
 }
 
 func (m *Microfab) createAndStartOrderer(organization *organization.Organization, apiPort, operationsPort int) error {
-	log.Printf("Creating and starting orderer for ordering organization %s ...", organization.Name())
+	logger.Printf("Creating and starting orderer for ordering organization %s ...", organization.Name())
 	directory := path.Join(m.config.Directory, "orderer")
 	orderer, err := orderer.New(
 		organization,
@@ -274,12 +329,47 @@ func (m *Microfab) createAndStartOrderer(organization *organization.Organization
 	m.Lock()
 	defer m.Unlock()
 	m.orderer = orderer
-	log.Printf("Created and started orderer for ordering organization %s", organization.Name())
+	logger.Printf("Created and started orderer for ordering organization %s", organization.Name())
 	return nil
 }
 
-func (m *Microfab) createAndStartPeer(organization *organization.Organization, apiPort, chaincodePort, operationsPort int) error {
-	log.Printf("Creating and starting peer for ordering organization %s ...", organization.Name())
+func (m *Microfab) waitForCouchDB() error {
+	logger.Printf("Waiting for CouchDB to start ...")
+	couchDB, err := couchdb.New("http://localhost:5984")
+	if err != nil {
+		return err
+	}
+	err = couchDB.WaitFor()
+	if err != nil {
+		return err
+	}
+	m.Lock()
+	defer m.Unlock()
+	m.couchDB = couchDB
+	logger.Printf("CouchDB has started")
+	return nil
+}
+
+func (m *Microfab) createAndStartCouchDBProxy(organization *organization.Organization, port int) error {
+	logger.Printf("Creating and starting CouchDB proxy for endorsing organization %s ...", organization.Name())
+	prefix := strings.ToLower(organization.Name())
+	proxy, err := m.couchDB.NewProxy(prefix, port)
+	if err != nil {
+		return err
+	}
+	err = proxy.Start()
+	if err != nil {
+		return err
+	}
+	m.Lock()
+	defer m.Unlock()
+	m.couchDBProxies = append(m.couchDBProxies, proxy)
+	logger.Printf("Created and started CouchDB proxy for endorsing organization %s", organization.Name())
+	return nil
+}
+
+func (m *Microfab) createAndStartPeer(organization *organization.Organization, apiPort, chaincodePort, operationsPort int, couchDB bool, couchDBProxyPort int) error {
+	logger.Printf("Creating and starting peer for endorsing organization %s ...", organization.Name())
 	organizationName := organization.Name()
 	lowerOrganizationName := strings.ToLower(organizationName)
 	peerDirectory := path.Join(m.config.Directory, fmt.Sprintf("peer-%s", lowerOrganizationName))
@@ -292,6 +382,8 @@ func (m *Microfab) createAndStartPeer(organization *organization.Organization, a
 		fmt.Sprintf("grpc://%speer-chaincode.%s:%d", lowerOrganizationName, m.config.Domain, m.config.Port),
 		int32(operationsPort),
 		fmt.Sprintf("http://%speer-operations.%s:%d", lowerOrganizationName, m.config.Domain, m.config.Port),
+		couchDB,
+		int32(couchDBProxyPort),
 	)
 	if err != nil {
 		return err
@@ -303,12 +395,39 @@ func (m *Microfab) createAndStartPeer(organization *organization.Organization, a
 	m.Lock()
 	defer m.Unlock()
 	m.peers = append(m.peers, peer)
-	log.Printf("Created and started peer for endorsing organization %s", organization.Name())
+	logger.Printf("Created and started peer for endorsing organization %s", organization.Name())
+	return nil
+}
+
+func (m *Microfab) createAndStartCA(organization *organization.Organization, apiPort, operationsPort int) error {
+	logger.Printf("Creating and starting CA for endorsing organization %s ...", organization.Name())
+	organizationName := organization.Name()
+	lowerOrganizationName := strings.ToLower(organizationName)
+	caDirectory := path.Join(m.config.Directory, fmt.Sprintf("ca-%s", lowerOrganizationName))
+	ca, err := ca.New(
+		organization,
+		caDirectory,
+		int32(apiPort),
+		fmt.Sprintf("http://%sca-api.%s:%d", lowerOrganizationName, m.config.Domain, m.config.Port),
+		int32(operationsPort),
+		fmt.Sprintf("http://%sca-operations.%s:%d", lowerOrganizationName, m.config.Domain, m.config.Port),
+	)
+	if err != nil {
+		return err
+	}
+	err = ca.Start()
+	if err != nil {
+		return err
+	}
+	m.Lock()
+	defer m.Unlock()
+	m.cas = append(m.cas, ca)
+	logger.Printf("Created and started CA for endorsing organization %s", organization.Name())
 	return nil
 }
 
 func (m *Microfab) createChannel(config Channel) (*common.Block, error) {
-	log.Printf("Creating channel %s ...", config.Name)
+	logger.Printf("Creating channel %s ...", config.Name)
 	opts := []channel.Option{
 		channel.WithCapabilityLevel(m.config.CapabilityLevel),
 	}
@@ -354,12 +473,12 @@ func (m *Microfab) createChannel(config Channel) (*common.Block, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Created channel %s", config.Name)
+	logger.Printf("Created channel %s", config.Name)
 	return genesisBlock, nil
 }
 
 func (m *Microfab) createAndJoinChannel(config Channel) error {
-	log.Printf("Creating and joining channel %s ...", config.Name)
+	logger.Printf("Creating and joining channel %s ...", config.Name)
 	genesisBlock, err := m.createChannel(config)
 	if err != nil {
 		return err
@@ -378,12 +497,12 @@ func (m *Microfab) createAndJoinChannel(config Channel) error {
 		}
 		if found {
 			eg.Go(func() error {
-				log.Printf("Joining channel %s on peer for endorsing organization %s ...", config.Name, peer.Organization().Name())
+				logger.Printf("Joining channel %s on peer for endorsing organization %s ...", config.Name, peer.Organization().Name())
 				err := connection.JoinChannel(genesisBlock)
 				if err != nil {
 					return err
 				}
-				log.Printf("Joined channel %s on peer for endorsing organization %s", config.Name, peer.Organization().Name())
+				logger.Printf("Joined channel %s on peer for endorsing organization %s", config.Name, peer.Organization().Name())
 				return nil
 			})
 		}
@@ -392,7 +511,7 @@ func (m *Microfab) createAndJoinChannel(config Channel) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("Created and joined channel %s", config.Name)
+	logger.Printf("Created and joined channel %s", config.Name)
 	return nil
 }
 
@@ -418,6 +537,13 @@ func (m *Microfab) stop() error {
 		}
 	}
 	m.peers = []*peer.Peer{}
+	for _, couchDBProxy := range m.couchDBProxies {
+		err := couchDBProxy.Stop()
+		if err != nil {
+			return err
+		}
+	}
+	m.couchDBProxies = []*couchdb.Proxy{}
 	if m.orderer != nil {
 		err := m.orderer.Stop()
 		if err != nil {

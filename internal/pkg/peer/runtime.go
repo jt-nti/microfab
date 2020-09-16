@@ -5,9 +5,10 @@
 package peer
 
 import (
+	"bufio"
 	"fmt"
-	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -53,7 +54,20 @@ func (p *Peer) Start() error {
 	if err != nil {
 		return err
 	}
-	go io.Copy(logFile, pipe)
+	go func() {
+		reader := bufio.NewReader(pipe)
+		scanner := bufio.NewScanner(reader)
+		scanner.Split(bufio.ScanLines)
+		id := strings.ToLower(p.identity.Name())
+		id = strings.ReplaceAll(id, " ", "")
+		logger := log.New(os.Stdout, fmt.Sprintf("[%16s] ", id), 0)
+		for scanner.Scan() {
+			logger.Println(scanner.Text())
+			logFile.WriteString(scanner.Text())
+		}
+		pipe.Close()
+		logFile.Close()
+	}()
 	cmd.Stderr = cmd.Stdout
 	err = cmd.Start()
 	if err != nil {
@@ -214,6 +228,24 @@ func (p *Peer) createConfig(dataDirectory, mspDirectory string) error {
 				"HOME",
 			},
 		},
+	}
+	ledger, ok := config["ledger"].(map[interface{}]interface{})
+	if !ok {
+		return fmt.Errorf("core.yaml missing ledger section")
+	}
+	state, ok := ledger["state"].(map[interface{}]interface{})
+	if !ok {
+		return fmt.Errorf("core.yaml missing ledger.state section")
+	}
+	if p.couchDB {
+		state["stateDatabase"] = "CouchDB"
+		couchDBConfig, ok := state["couchDBConfig"].(map[interface{}]interface{})
+		if !ok {
+			return fmt.Errorf("core.yaml missing ledger.state.couchDBConfig section")
+		}
+		couchDBConfig["couchDBAddress"] = fmt.Sprintf("localhost:%d", p.couchDBPort)
+		couchDBConfig["username"] = "admin"
+		couchDBConfig["password"] = "adminpw"
 	}
 	configData, err = yaml.Marshal(config)
 	if err != nil {
