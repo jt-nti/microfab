@@ -57,7 +57,7 @@ FROM base AS wasmcc
 WORKDIR /tmp/wasmer
 RUN curl -sSL https://github.com/wasmerio/wasmer/releases/download/0.17.1/wasmer-c-api-linux-amd64.tar.gz | tar xzf -
 WORKDIR /tmp/wasmcc
-RUN git clone https://github.com/hyperledgendary/fabric-chaincode-wasm.git \
+RUN git clone -b tp1 --depth 1 https://github.com/hyperledgendary/fabric-chaincode-wasm.git \
     && cd fabric-chaincode-wasm \
     && go get -d -v ./... \
     && go install -v ./...
