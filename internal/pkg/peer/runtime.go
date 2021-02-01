@@ -31,11 +31,12 @@ func (p *Peer) Start(timeout time.Duration) error {
 	dataDirectory := path.Join(p.directory, "data")
 	logsDirectory := path.Join(p.directory, "logs")
 	mspDirectory := path.Join(p.directory, "msp")
+	snapshotDirectory := path.Join(p.directory, "snapshots")
 	err = util.CreateMSPDirectory(mspDirectory, p.identity)
 	if err != nil {
 		return err
 	}
-	err = p.createConfig(dataDirectory, mspDirectory)
+	err = p.createConfig(dataDirectory, mspDirectory, snapshotDirectory)
 	if err != nil {
 		return err
 	}
@@ -118,6 +119,7 @@ func (p *Peer) createDirectories() error {
 		path.Join(p.directory, "data"),
 		path.Join(p.directory, "logs"),
 		path.Join(p.directory, "msp"),
+		path.Join(p.directory, "snapshots"),
 	}
 	for _, dir := range directories {
 		err := os.MkdirAll(dir, 0755)
@@ -128,7 +130,7 @@ func (p *Peer) createDirectories() error {
 	return nil
 }
 
-func (p *Peer) createConfig(dataDirectory, mspDirectory string) error {
+func (p *Peer) createConfig(dataDirectory, mspDirectory, snapshotDirectory string) error {
 	fabricConfigPath, ok := os.LookupEnv("FABRIC_CFG_PATH")
 	if !ok {
 		return fmt.Errorf("FABRIC_CFG_PATH not defined")
@@ -226,6 +228,11 @@ func (p *Peer) createConfig(dataDirectory, mspDirectory string) error {
 	if !ok {
 		return fmt.Errorf("core.yaml missing ledger section")
 	}
+	snapshots, ok := ledger["snapshots"].(map[interface{}]interface{})
+	if !ok {
+		return fmt.Errorf("core.yaml missing ledger.snapshots section")
+	}
+	snapshots["rootDir"] = snapshotDirectory
 	state, ok := ledger["state"].(map[interface{}]interface{})
 	if !ok {
 		return fmt.Errorf("core.yaml missing ledger.state section")
